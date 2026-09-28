@@ -59,6 +59,12 @@ const connections = new Map();
 
 const connecting = new Set();
 
+/*
+ * Track pairing code requests per session to avoid race conditions.
+ */
+
+const pairingRequests = new Map();
+
 function sessionPath(sessionId) {
   return path.join(SESSIONS_DIR, sessionId);
 }
@@ -68,12 +74,6 @@ function safeSessionId(id) {
     .replace(/[^a-zA-Z0-9_-]/g, "")
     .slice(0, 80);
 }
-
-/*
- * Normalize phone number.
- * Remove: +, spaces, -, ()
- * Keep only digits.
- */
 
 function normalizePhoneNumber(phoneNumber) {
   return String(phoneNumber || "")
@@ -148,7 +148,8 @@ async function connectWhatsApp(sessionId) {
       logger,
       browser: Browsers.macOS("WA Agent Studio"),
       markOnlineOnConnect: false,
-      printQRInTerminal: false
+      printQRInTerminal: false,
+      syncFullHistory: false
     };
 
     if (version) {
@@ -358,8 +359,8 @@ app.post("/connect", async (req, res) => {
  *   "phoneNumber": "2348012345678"
  * }
  *
- * Phone number must contain country code.
- * Will be normalized to digits only.
+ * Phone number can include country code and may contain
+ * special characters. Will be normalized to digits only.
  */
 
 app.post("/pair", async (req, res) => {
@@ -386,48 +387,129 @@ app.post("/pair", async (req, res) => {
       });
     }
 
-    let info = connections.get(sessionId);
+    /*
+     * Prevent multiple simultaneous pairing requests for same session.
+     */
 
-    if (!info || !info.sock) {
-      await connectWhatsApp(sessionId);
-      info = connections.get(sessionId);
-    }
-
-    if (!info || !info.sock) {
-      return res.status(500).json({
+    if (pairingRequests.has(sessionId)) {
+      return res.status(409).json({
         success: false,
-        error: "WhatsApp socket is not ready"
+        error: "Pairing request already in progress"
       });
     }
 
-    if (info.sock.authState?.creds?.registered) {
+    pairingRequests.set(sessionId, true);
+
+    try {
+      let info = connections.get(sessionId);
+
+      if (!info || !info.sock) {
+        await connectWhatsApp(sessionId);
+        info = connections.get(sessionId);
+      }
+
+      if (!info || !info.sock) {
+        return res.status(500).json({
+          success: false,
+          error: "WhatsApp socket is not ready"
+        });
+      }
+
+      if (info.sock.authState?.creds?.registered) {
+        return res.status(400).json({
+          success: false,
+          error: "This session is already registered"
+        });
+      }
+
+      /*
+       * Request pairing code from Baileys.
+       * Baileys handles the connection state internally.
+       */
+
+      const code =
+        await info.sock.requestPairingCode(phoneNumber);
+
+      info.pairingCode = code;
+      info.status = "pairing";
+
+      console.log(
+        `[${sessionId}] Pairing code requested: ${code}`
+      );
+
+      res.json({
+        success: true,
+        sessionId,
+        pairingCode: code
+      });
+    } finally {
+      pairingRequests.delete(sessionId);
+    }
+  } catch (error) {
+    console.error("PAIRING ERROR:", error);
+
+    pairingRequests.delete(safeSessionId(req.body.sessionId));
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/*
+ * Get QR code as PNG image.
+ *
+ * GET /qr/:sessionId
+ *
+ * Returns the QR code as a PNG image if available.
+ * Returns 404 if QR code is not available.
+ */
+
+app.get("/qr/:sessionId", (req, res) => {
+  try {
+    const sessionId = safeSessionId(
+      req.params.sessionId
+    );
+
+    if (!sessionId) {
       return res.status(400).json({
         success: false,
-        error: "This session is already registered"
+        error: "sessionId is required"
+      });
+    }
+
+    const info = connections.get(sessionId);
+
+    if (!info || !info.qrDataUrl) {
+      return res.status(404).json({
+        success: false,
+        error: "QR code not available"
       });
     }
 
     /*
-     * Give the socket a moment to initialize.
+     * Extract base64 data from data URL.
+     * Format: data:image/png;base64,<base64_data>
      */
 
-    await new Promise((resolve) =>
-      setTimeout(resolve, 2000)
-    );
+    const base64Match = info.qrDataUrl.match(/base64,(.+)$/);
 
-    const code =
-      await info.sock.requestPairingCode(phoneNumber);
+    if (!base64Match) {
+      return res.status(500).json({
+        success: false,
+        error: "Invalid QR code format"
+      });
+    }
 
-    info.pairingCode = code;
-    info.status = "pairing";
+    const base64Data = base64Match[1];
+    const pngBuffer = Buffer.from(base64Data, "base64");
 
-    res.json({
-      success: true,
-      sessionId,
-      pairingCode: code
-    });
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Content-Length", pngBuffer.length);
+    res.send(pngBuffer);
   } catch (error) {
-    console.error("PAIRING ERROR:", error);
+    console.error("QR CODE ERROR:", error);
 
     res.status(500).json({
       success: false,
@@ -467,63 +549,6 @@ app.get("/status/:sessionId", (req, res) => {
     connectedAt: info.connectedAt,
     lastError: info.lastError
   });
-});
-
-/*
- * Get QR code as PNG image.
- *
- * GET /qr/sessionId
- *
- * Returns PNG image if QR exists.
- * Returns 404 JSON if QR not available.
- */
-
-app.get("/qr/:sessionId", (req, res) => {
-  const sessionId = safeSessionId(
-    req.params.sessionId
-  );
-
-  const info = connections.get(sessionId);
-
-  if (!info || !info.qrDataUrl) {
-    return res.status(404).json({
-      success: false,
-      error: "QR code not available"
-    });
-  }
-
-  try {
-    /*
-     * Extract base64 data from data URL.
-     * Format: data:image/png;base64,<base64-data>
-     */
-
-    const base64Match = info.qrDataUrl.match(
-      /data:image\/png;base64,(.+)$/
-    );
-
-    if (!base64Match || !base64Match[1]) {
-      return res.status(500).json({
-        success: false,
-        error: "Invalid QR data format"
-      });
-    }
-
-    const pngBuffer = Buffer.from(
-      base64Match[1],
-      "base64"
-    );
-
-    res.set("Content-Type", "image/png");
-    res.send(pngBuffer);
-  } catch (error) {
-    console.error("QR RETRIEVAL ERROR:", error);
-
-    res.status(500).json({
-      success: false,
-      error: "Failed to retrieve QR code"
-    });
-  }
 });
 
 /*
